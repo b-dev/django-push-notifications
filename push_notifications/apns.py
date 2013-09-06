@@ -10,108 +10,144 @@ import urllib2
 from binascii import unhexlify
 from django.conf import settings
 from . import NotificationError, PUSH_NOTIFICATIONS_SETTINGS as SETTINGS
+from .exceptions import NotificationPayloadSizeExceeded, InvalidPassPhrase
 
 
 class APNSError(NotificationError):
-	pass
+    pass
 
 class APNSDataOverflow(APNSError):
-	pass
+    pass
 
 SETTINGS.setdefault("APNS_PORT", 2195)
 if settings.DEBUG:
-	SETTINGS.setdefault("APNS_HOST", "gateway.sandbox.push.apple.com")
+    SETTINGS.setdefault("APNS_HOST", "gateway.sandbox.push.apple.com")
 else:
-	SETTINGS.setdefault("APNS_HOST", "gateway.push.apple.com")
+    SETTINGS.setdefault("APNS_HOST", "gateway.push.apple.com")
 
 APNS_MAX_NOTIFICATION_SIZE = 256
 
 
 def _apns_create_socket():
-	import ssl
-	from socket import socket
-	from django.core.exceptions import ImproperlyConfigured
+    """
+    Establishes an encrypted SSL socket connection to the service.
+    After connecting the socket can be written to or read from.
+    """
+    import ssl
+    import socket
+    import OpenSSL
+    from django.core.exceptions import ImproperlyConfigured
 
-	sock = socket()
-	certfile = SETTINGS.get("APNS_CERTIFICATE")
-	if not certfile:
-		raise ImproperlyConfigured('You need to set PUSH_NOTIFICATIONS_SETTINGS["APNS_CERTIFICATE"] to send messages through APNS.')
+    # ssl in Python < 3.2 does not support certificates/keys as strings.
+    # See http://bugs.python.org/issue3823
+    # Therefore pyOpenSSL which lets us do this is a dependancy.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    certificate = SETTINGS.get("APNS_CERTIFICATE")
+    private_key = SETTINGS.get("APNS_PRIVATE_KEY")
+    passphrase = SETTINGS.get("APNS_PRIVATE_KEY_PASSPHRASE")
+    cert = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, certificate)
+    args = [OpenSSL.crypto.FILETYPE_PEM, private_key]
+    if passphrase is not None:
+        args.append(str(passphrase))
+    try:
+        pkey = OpenSSL.crypto.load_privatekey(*args)
+    except OpenSSL.crypto.Error:
+        raise InvalidPassPhrase
+    context = OpenSSL.SSL.Context(OpenSSL.SSL.SSLv3_METHOD)
+    context.use_certificate(cert)
+    context.use_privatekey(pkey)
+    connection = OpenSSL.SSL.Connection(context, sock)
+    connection.connect((SETTINGS["APNS_HOST"], SETTINGS["APNS_PORT"]))
+    connection.set_connect_state()
+    connection.do_handshake()
+    return connection
 
-	try:
-		f = open(certfile, "r")
-		f.read()
-		f.close()
-	except Exception, e:
-		raise ImproperlyConfigured("The APNS certificate file at %r is not readable: %s" % (certfile, e))
 
-	sock = ssl.wrap_socket(sock, ssl_version=ssl.PROTOCOL_SSLv3, certfile=certfile)
-	sock.connect((SETTINGS["APNS_HOST"], SETTINGS["APNS_PORT"]))
+def _apns_create_socket_old():
+    import ssl
+    from socket import socket
+    from django.core.exceptions import ImproperlyConfigured
 
-	return sock
+    sock = socket()
+    certfile = SETTINGS.get("APNS_CERTIFICATE")
+    if not certfile:
+        raise ImproperlyConfigured('You need to set PUSH_NOTIFICATIONS_SETTINGS["APNS_CERTIFICATE"] to send messages through APNS.')
+
+    try:
+        f = open(certfile, "r")
+        f.read()
+        f.close()
+    except Exception, e:
+        raise ImproperlyConfigured("The APNS certificate file at %r is not readable: %s" % (certfile, e))
+
+    sock = ssl.wrap_socket(sock, ssl_version=ssl.PROTOCOL_SSLv3, certfile=certfile)
+    sock.connect((SETTINGS["APNS_HOST"], SETTINGS["APNS_PORT"]))
+
+    return sock
 
 def _apns_pack_message(token, data):
-	format = "!cH32sH%ds" % (len(data))
-	return struct.pack(format, b"\0", 32, unhexlify(token), len(data), data)
+    format = "!cH32sH%ds" % (len(data))
+    return struct.pack(format, b"\0", 32, unhexlify(token), len(data), data)
 
 def _apns_send(token, alert, badge=0, sound="chime", content_available=False, action_loc_key=None, loc_key=None, loc_args=[], extra={}, socket=None):
-	data = {}
+    data = {}
 
-	if action_loc_key or loc_key or loc_args:
-		alert = {"body": alert}
-		if action_loc_key:
-			alert["action-loc-key"] = action_loc_key
-		if loc_key:
-			alert["loc-key"] = loc_key
-		if loc_args:
-			alert["loc-args"] = loc_args
+    if action_loc_key or loc_key or loc_args:
+        alert = {"body": alert}
+        if action_loc_key:
+            alert["action-loc-key"] = action_loc_key
+        if loc_key:
+            alert["loc-key"] = loc_key
+        if loc_args:
+            alert["loc-args"] = loc_args
 
-	data["alert"] = alert
+    data["alert"] = alert
 
-	if badge:
-		data["badge"] = badge
+    if badge:
+        data["badge"] = badge
 
-	if sound:
-		data["sound"] = sound
+    if sound:
+        data["sound"] = sound
 
-	if content_available:
-		data["content-available"] = 1
+    if content_available:
+        data["content-available"] = 1
 
-	data.update(extra)
+    data.update(extra)
 
-	# convert to json, avoiding unnecessary whitespace with separators
-	data = json.dumps({"aps": data}, separators=(",", ":"))
+    # convert to json, avoiding unnecessary whitespace with separators
+    data = json.dumps({"aps": data}, separators=(",", ":"))
 
-	if len(data) > APNS_MAX_NOTIFICATION_SIZE:
-		raise APNSDataOverflow("Notification body cannot exceed %i bytes" % (APNS_MAX_NOTIFICATION_SIZE))
+    if len(data) > APNS_MAX_NOTIFICATION_SIZE:
+        raise APNSDataOverflow("Notification body cannot exceed %i bytes" % (APNS_MAX_NOTIFICATION_SIZE))
 
-	data = _apns_pack_message(token, data)
+    data = _apns_pack_message(token, data)
 
-	if socket:
-		socket.write(data)
-	else:
-		socket = _apns_create_socket()
-		socket.write(data)
-		socket.close()
+    if socket:
+        socket.write(data)
+    else:
+        socket = _apns_create_socket()
+        socket.write(data)
+        socket.close()
 
 
 def apns_send_message(registration_id, data, **kwargs):
-	"""
-	Sends an APNS notification to a single registration_id.
-	This will send the notification as form data.
-	If sending multiple notifications, it is more efficient to use
-	apns_send_bulk_message()
-	Note that \a data should always be a string.
-	"""
+    """
+    Sends an APNS notification to a single registration_id.
+    This will send the notification as form data.
+    If sending multiple notifications, it is more efficient to use
+    apns_send_bulk_message()
+    Note that \a data should always be a string.
+    """
 
-	return _apns_send(registration_id, data, **kwargs)
+    return _apns_send(registration_id, data, **kwargs)
 
 def apns_send_bulk_message(registration_ids, data, **kwargs):
-	"""
-	Sends an APNS notification to one or more registration_ids.
-	The registration_ids argument needs to be a list.
-	"""
-	socket = _apns_create_socket()
-	for registration_id in registration_ids:
-		_apns_send(registration_id, data, socket=socket, **kwargs)
+    """
+    Sends an APNS notification to one or more registration_ids.
+    The registration_ids argument needs to be a list.
+    """
+    socket = _apns_create_socket()
+    for registration_id in registration_ids:
+        _apns_send(registration_id, data, socket=socket, **kwargs)
 
-	socket.close()
+    socket.close()

@@ -1,2 +1,3 @@
 Django
+pyOpenSSL
 django-uuidfield
